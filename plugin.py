@@ -2012,8 +2012,12 @@ class Plugin:
                     )
 
                 # Get or create EPGData entry for this channel.
-                # Use channel_number as tvg_id since Dispatcharr uses channel_number as the ID in EPG XML output.
-                channel_tvg_id = str(channel_number)
+                # Use channel_number as tvg_id since Dispatcharr uses
+                # channel_number as the ID in EPG XML output. Route through
+                # ``_entry_tvg_id`` so whole-number channels render as
+                # ``"9104"`` (not ``"9104.0"``) — matching the legacy
+                # convention operators expect.
+                channel_tvg_id = self._entry_tvg_id(channel_number)
                 # EPGData.name mirrors Channel.name EXACTLY so operators
                 # can navigate the EPG grid by the same labels they see in
                 # the channels table. A YouTube channel with multiple
@@ -3831,14 +3835,30 @@ class Plugin:
         return result
 
     def _entry_tvg_id(self, channel_number: Any) -> str:
-        """The single canonical tvg_id convention: ``str(channel_number)``.
+        """The single canonical tvg_id convention.
 
-        Both ``_create_stream_and_channel`` and the upsert path use this so
-        EPGData.tvg_id, ProgramData.tvg_id, Channel.tvg_id, and the
-        ``<channel id="...">`` / ``<programme channel="...">`` attributes in
-        the XMLTV all line up without surprises.
+        Whole-number channel_numbers render without a ``.0`` decimal
+        (``9104`` rather than ``9104.0``); sub-channels keep their
+        fractional form (``9104.5``). The output is what Dispatcharr
+        uses as ``Channel.tvg_id`` on its side, so matching it avoids
+        duplicate XMLTV rows per channel that previously appeared when
+        some places emitted ``"9104"`` and others emitted ``"9104.0"``.
+
+        Both ``_create_stream_and_channel`` and the upsert path use
+        this so EPGData.tvg_id, ProgramData.tvg_id, Channel.tvg_id,
+        and the XMLTV ``<channel id="...">`` /
+        ``<programme channel="...">`` attributes all line up without
+        surprises.
         """
-        return "" if channel_number is None else str(channel_number)
+        if channel_number is None:
+            return ""
+        try:
+            num = float(channel_number)
+        except (TypeError, ValueError):
+            return str(channel_number)
+        if num.is_integer():
+            return str(int(num))
+        return str(num)
 
     def _gather_youtube_entries(
         self,
@@ -3951,19 +3971,46 @@ class Plugin:
                 .only("id", "name", "channel_number", "tvg_id")
             )
             for ch in channels:
-                tvg = self._entry_tvg_id(
-                    ch.tvg_id or ch.channel_number
-                )
+                # Always key entries by the canonical tvg_id shape
+                # ``str(channel_number)`` — never ``ch.tvg_id`` outright.
+                # Channel.tvg_id is a free-form CharField that older
+                # YouTubearr / Dispatcharr versions may have written
+                # without the ``.0`` decimal (e.g. "9104" instead of
+                # "9104.0"), and we MUST match the canonical shape so
+                # that the XMLTV file's <channel id="..."> matches the
+                # <programme channel="..."> AND matches what
+                # ``_create_stream_and_channel`` writes for new streams.
+                # Mixing the two variants in the same ``grouped`` dict
+                # produced duplicate XMLTV rows per channel.
+                tvg = self._entry_tvg_id(ch.channel_number)
                 if not tvg or tvg in grouped:
                     continue
                 channel_label = getattr(ch, "name", None) or "YouTube Live"
+                # Title must NOT mirror the channel name — operators see
+                # the channel name as the channel label (from
+                # channel_name), and you don't want the programme row
+                # to read "NASA #1" when the row title should be the
+                # actual livestream title. Pull the last-known title
+                # from the Stream row YouTubearr originally created
+                # (Stream.name carries info["title"] verbatim), and
+                # fall back to a clearly-offline indicator.
+                last_known_title = None
+                try:
+                    stream_qs = ch.streams.all().order_by("-channelstream__order")
+                    for stream_obj in stream_qs:
+                        if stream_obj.name and stream_obj.name != channel_label:
+                            last_known_title = stream_obj.name
+                            break
+                except Exception:
+                    pass
+                ended_title = last_known_title or f"(offline) {channel_label}"
                 grouped[tvg] = {
                     "tvg_id": tvg,
                     "channel_id": ch.id,
                     "channel_number": ch.channel_number,
                     "channel_name": channel_label,
-                    "title": channel_label,
-                    "description": channel_label,
+                    "title": ended_title,
+                    "description": ended_title,
                     "icon_url": "",
                     "youtube_video_id": None,
                     "youtube_channel_id": None,
