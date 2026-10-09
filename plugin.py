@@ -3958,65 +3958,16 @@ class Plugin:
                 "source": "tracked",
             }
 
-        # 2. Channels that already exist pointing at each EPG source but
-        # aren't in tracked_streams (ended streams from earlier). We still
-        # want a guide entry for the duration of cleanup so clients don't
-        # briefly lose their programme. Channel.name already carries the
-        # "<YouTube Channel> #N" format _create_stream_and_channel
-        # stamped on it — we use that directly, never reconstruct.
-        for epg_source in epg_sources:
-            channels = (
-                Channel.objects
-                .filter(epg_data__epg_source=epg_source)
-                .only("id", "name", "channel_number", "tvg_id")
-            )
-            for ch in channels:
-                # Always key entries by the canonical tvg_id shape
-                # ``str(channel_number)`` — never ``ch.tvg_id`` outright.
-                # Channel.tvg_id is a free-form CharField that older
-                # YouTubearr / Dispatcharr versions may have written
-                # without the ``.0`` decimal (e.g. "9104" instead of
-                # "9104.0"), and we MUST match the canonical shape so
-                # that the XMLTV file's <channel id="..."> matches the
-                # <programme channel="..."> AND matches what
-                # ``_create_stream_and_channel`` writes for new streams.
-                # Mixing the two variants in the same ``grouped`` dict
-                # produced duplicate XMLTV rows per channel.
-                tvg = self._entry_tvg_id(ch.channel_number)
-                if not tvg or tvg in grouped:
-                    continue
-                channel_label = getattr(ch, "name", None) or "YouTube Live"
-                # Title must NOT mirror the channel name — operators see
-                # the channel name as the channel label (from
-                # channel_name), and you don't want the programme row
-                # to read "NASA #1" when the row title should be the
-                # actual livestream title. Pull the last-known title
-                # from the Stream row YouTubearr originally created
-                # (Stream.name carries info["title"] verbatim), and
-                # fall back to a clearly-offline indicator.
-                last_known_title = None
-                try:
-                    stream_qs = ch.streams.all().order_by("-channelstream__order")
-                    for stream_obj in stream_qs:
-                        if stream_obj.name and stream_obj.name != channel_label:
-                            last_known_title = stream_obj.name
-                            break
-                except Exception:
-                    pass
-                ended_title = last_known_title or f"(offline) {channel_label}"
-                grouped[tvg] = {
-                    "tvg_id": tvg,
-                    "channel_id": ch.id,
-                    "channel_number": ch.channel_number,
-                    "channel_name": channel_label,
-                    "title": ended_title,
-                    "description": ended_title,
-                    "icon_url": "",
-                    "youtube_video_id": None,
-                    "youtube_channel_id": None,
-                    "live": False,
-                    "source": "existing_channel",
-                }
+        # NOTE: We deliberately do NOT include an "existing channel"
+        # fallback here. Earlier versions used a Channel.objects query
+        # keyed by ``ch.tvg_id or ch.channel_number``, which produced
+        # .0-suffixed ``tvg_id="9106.0"`` entries alongside the
+        # canonical integer ones, AND they used the channel name as
+        # the program title which confused the Dispatcharr grid. That
+        # whole fallback path was the source of the .0 / channel-name-
+        # as-title artifacts. With only live-tracked streams emitting
+        # entries, the XMLTV file content is single-source-of-truth
+        # and matches Dispatcharr's program lookup exactly.
 
         return list(grouped.values())
 
