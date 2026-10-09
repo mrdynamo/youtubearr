@@ -214,14 +214,21 @@ class Plugin:
             "id": "info_epg",
             "label": "EPG Settings",
             "type": "info",
-            "description": "Automatically create and assign a Dummy EPG source to YouTube channels.",
+            "description": "Automatically create and assign an EPG source to YouTube channels.",
         },
         {
             "id": "epg_source_name",
             "label": "EPG Source Name",
             "type": "string",
             "default": "YouTube Live",
-            "help_text": "Name for the Dummy EPG source. Will be auto-created if it doesn't exist. Leave empty to skip EPG assignment. Supports {title} (video title) and {channel} (YouTube channel name) placeholders — e.g. '{channel} Live' creates a separate EPG source per YouTube channel. Note: {title} creates one source per individual stream.",
+            "help_text": "Name for the EPG source YouTubearr creates in Dispatcharr. Auto-created if it doesn't exist. Leave empty to skip EPG assignment. Supports {title} (video title) and {channel} (YouTube channel name) placeholders — e.g. '{channel} Live' creates a separate EPG source per YouTube channel. Note: {title} creates one source per individual stream.",
+        },
+        {
+            "id": "epg_data_dir",
+            "label": "EPG Data Directory (optional override)",
+            "type": "string",
+            "default": "",
+            "help_text": "Directory where YouTubearr writes its per-source XMLTV files (Dispatcharr reads them via each EPG source's file_path). Leave empty to use the default '<plugin_dir>/epg/' subfolder. Set this if you want the files on a separate disk or a path Dispatcharr can reach across containers (e.g. mounted /data). Each source gets its own file at <directory>/youtubearr-<source_id>.xmltv.",
         },
         {
             "id": "info_advanced",
@@ -1890,16 +1897,49 @@ class Plugin:
         epg_source_name = epg_source_name.replace("{title}", video_title).replace("{channel}", youtube_channel_name)
         if epg_source_name:
             try:
-                # Get or create the Dummy EPG source
+                # Get or create the EPG source. Dispatcharr's `dummy` source type
+                # IGNORES any ProgramData.title / ProgramData.description rows that
+                # we write directly — its XMLTV serving code regenerates programs
+                # on-demand from the source's `custom_properties` patterns (see
+                # Dispatcharr apps/output/dummy_epg.py and apps/output/epg.py).
+                # We instead use `xmltv` with a local `file_path` that points at
+                # this plugin's XMLTV cache file, which IS read into ProgramData
+                # and surfaced to clients correctly. (YouTubearr v1.12.0..v1.40.x
+                # used `dummy` and worked only because older Dispatcharr versions
+                # materialized placeholder rows into ProgramData. The 2026-08-27
+                # Dispatcharr refactor changed that — see Dispatcharr commit
+                # aba5fc5. Twitcharr switched to this same xmltv+file_path pattern
+                # to fix the same regression.)
                 epg_source_obj, source_created = EPGSource.objects.get_or_create(
                     name=epg_source_name,
                     defaults={
-                        "source_type": "dummy",
+                        "source_type": "xmltv",
                         "is_active": True,
                     }
                 )
                 if source_created:
-                    self._log(f"Created Dummy EPG source: {epg_source_name}")
+                    self._log(f"Created EPG source: {epg_source_name} (type=xmltv)")
+
+                # If the source pre-dates this fix (still `dummy`, or `xmltv`
+                # without a file_path), migrate it to the new shape in-place. We
+                # only write fields that actually drifted so an unconditional save
+                # doesn't re-fire Dispatcharr's EPGSource post_save signal and
+                # rewrite Celery beat tables on every cycle.
+                desired_file_path = self._xmltv_path(epg_source_obj.id, settings)
+                _drift_fields = []
+                if epg_source_obj.source_type != "xmltv":
+                    _drift_fields.append("source_type")
+                if epg_source_obj.file_path != desired_file_path:
+                    _drift_fields.append("file_path")
+                if _drift_fields:
+                    if "source_type" in _drift_fields:
+                        epg_source_obj.source_type = "xmltv"
+                    if "file_path" in _drift_fields:
+                        epg_source_obj.file_path = desired_file_path
+                    epg_source_obj.save(update_fields=_drift_fields)
+                    self._log(
+                        f"Migrated EPG source '{epg_source_name}' to xmltv with file_path={desired_file_path}"
+                    )
 
                 # Get or create EPGData entry for this channel.
                 # Use channel_number as tvg_id since Dispatcharr uses channel_number as the ID in EPG XML output.
@@ -1924,28 +1964,11 @@ class Plugin:
                 channel.save(update_fields=['epg_data', 'tvg_id'])
                 self._log(f"Assigned EPG '{epg_source_name}' to channel with tvg_id={channel_tvg_id}")
 
-                # Ensure a single program exists so the guide shows the stream title.
-                now = timezone.now()
-                program_obj, _ = ProgramData.objects.update_or_create(
-                    epg=epg_data,
-                    tvg_id=channel_tvg_id,
-                    defaults={
-                        "title": video_title,
-                        "description": video_title,
-                        "start_time": now,
-                        "end_time": now + timedelta(hours=12),
-                    },
-                )
-                try:
-                    _existing_pp = getattr(program_obj, 'custom_properties', None)
-                    program_obj.custom_properties = self._merge_youtubearr_custom_properties(
-                        _existing_pp if isinstance(_existing_pp, dict) else {},
-                        youtube_video_id=video_id,
-                        youtube_channel_id=youtube_channel_id,
-                    )
-                    program_obj.save(update_fields=['custom_properties'])
-                except Exception:
-                    pass  # custom_properties may not exist on this Dispatcharr version
+                # EPGData + ProgramData + Channel link are written in a single
+                # atomic batch by _upsert_db() on the next _generate_xmltv_cache
+                # call (which fires from this create path's webhook). Direct
+                # ProgramData writes here are no longer needed and would
+                # double-write under Twitcharr's wipe+bulk_create pattern.
             except Exception as epg_exc:
                 self._log(f"Could not assign EPG: {epg_exc}")
 
@@ -3281,60 +3304,43 @@ class Plugin:
     def _refresh_epg_times(self, settings: Dict[str, Any]) -> int:
         """Refresh EPG programme times for all active streams.
 
-        Keeps EPG current by updating start/end times to now + 12 hours.
-        Returns count of refreshed programmes.
+        Under the Twitcharr pattern, the actual wiping/recreating of
+        ProgramData rows happens inside ``_upsert_db`` and the XMLTV file is
+        rewritten from the in-memory entries dict. This function is now a
+        thin delegator that hands off to ``_generate_xmltv_cache`` (which is
+        the single owner of the db↔file cycle).
+
+        Returns the number of EPGSource rows whose XMLTV file was rewritten.
+        Kept on the public polling hook so older Dispatcharr paths still
+        calling ``self._refresh_epg_times`` continue to work.
         """
-        tracked_streams = settings.get("tracked_streams", {})
-        refreshed_count = 0
+        try:
+            # Snapshot EPG sources in the configured group; the cache
+            # generator will re-discover them based on settings, but we
+            # want a count for the return value here.
+            template = (settings or {}).get("epg_source_name", "YouTube Live").strip()
+            if not template:
+                return 0
+            if "{" in template:
+                group_name = settings.get("channel_group_name", self._channel_group_name)
+                try:
+                    group = ChannelGroup.objects.get(name=group_name)
+                    sources_qs = EPGSource.objects.filter(
+                        epgdata__channel__channel_group=group
+                    ).distinct()
+                except ChannelGroup.DoesNotExist:
+                    return 0
+            else:
+                sources_qs = EPGSource.objects.filter(name=template)
+            sources = list(sources_qs)
+        except Exception:
+            return 0
 
-        for video_id, stream_data in tracked_streams.items():
-            if not stream_data.get("is_live"):
-                continue
+        if not sources:
+            return 0
 
-            channel_id = stream_data.get("channel_id")
-            if not channel_id:
-                continue
-
-            try:
-                from django.utils import timezone as dj_timezone
-                channel = Channel.objects.get(id=channel_id)
-                if channel.epg_data:
-                    prog_now = dj_timezone.now()
-                    updated = ProgramData.objects.filter(
-                        epg=channel.epg_data
-                    ).update(
-                        start_time=prog_now,
-                        end_time=prog_now + timedelta(hours=12)
-                    )
-                    if updated > 0:
-                        refreshed_count += 1
-                    else:
-                        # No ProgramData row exists — create one so the EPG window stays current.
-                        # This repairs channels whose program entry was deleted externally or
-                        # expired after a long monitoring outage.
-                        channel_tvg_id = channel.tvg_id or str(channel.channel_number)
-                        title = stream_data.get("title", "YouTube Live")
-                        try:
-                            ProgramData.objects.update_or_create(
-                                epg=channel.epg_data,
-                                tvg_id=channel_tvg_id,
-                                defaults={
-                                    "title": title,
-                                    "description": title,
-                                    "start_time": prog_now,
-                                    "end_time": prog_now + timedelta(hours=12),
-                                }
-                            )
-                            refreshed_count += 1
-                            self._log(f"Created missing EPG program for channel {channel_id} (tvg_id={channel_tvg_id})")
-                        except Exception as create_exc:
-                            self._log_error(f"Failed to create EPG program for channel {channel_id}: {create_exc}")
-            except Channel.DoesNotExist:
-                pass
-            except Exception as exc:
-                self._log_error(f"Failed to refresh EPG for channel {channel_id}: {exc}")
-
-        return refreshed_count
+        self._generate_xmltv_cache(settings)
+        return len(sources)
 
     # --- Cleanup ---
 
@@ -3736,6 +3742,280 @@ class Plugin:
         result.update(metadata)
         return result
 
+    def _entry_tvg_id(self, channel_number: Any) -> str:
+        """The single canonical tvg_id convention: ``str(channel_number)``.
+
+        Both ``_create_stream_and_channel`` and the upsert path use this so
+        EPGData.tvg_id, ProgramData.tvg_id, Channel.tvg_id, and the
+        ``<channel id="...">`` / ``<programme channel="...">`` attributes in
+        the XMLTV all line up without surprises.
+        """
+        return "" if channel_number is None else str(channel_number)
+
+    def _gather_youtube_entries(
+        self,
+        epg_sources: List[Any],
+        settings: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Build the in-memory entries dict that ``_upsert_db`` consumes.
+
+        Mirrors Twitcharr's ``_gather_entries``: collect every live stream
+        (sources of truth: ``tracked_streams`` settings plus any Channels
+        that already exist pointing at each EPG source), normalise into a
+        common shape, and group by ``tvg_id``. The returned dicts include
+        everything the rest of the pipeline needs without ever reading
+        ``ProgramData`` — we re-derive the guide each refresh from the
+        authoritative live data.
+        """
+        tracked_streams = (settings or {}).get("tracked_streams", {}) or {}
+        grouped: Dict[str, Dict[str, Any]] = {}
+
+        # 1. Live streams YouTubearr knows about right now.
+        for video_id, stream_data in tracked_streams.items():
+            if not isinstance(stream_data, dict):
+                continue
+            if not stream_data.get("is_live"):
+                continue
+            channel_id = stream_data.get("channel_id")
+            channel_number = stream_data.get("channel_number")
+            if channel_id is None or channel_number is None:
+                continue
+            tvg = self._entry_tvg_id(channel_number)
+            grouped[tvg] = {
+                "tvg_id": tvg,
+                "channel_id": channel_id,
+                "channel_number": channel_number,
+                "channel_name": stream_data.get("channel") or stream_data.get("channel_name") or "YouTube",
+                "title": stream_data.get("title") or "Live stream",
+                "description": stream_data.get("description") or stream_data.get("title") or "Live stream",
+                "icon_url": stream_data.get("icon_url") or "",
+                "youtube_video_id": video_id,
+                "youtube_channel_id": stream_data.get("youtube_channel_id") or stream_data.get("youtube_channel"),
+                "live": True,
+                "source": "tracked",
+            }
+
+        # 2. Channels that already exist pointing at each EPG source but
+        # aren't in tracked_streams (ended streams from earlier). We still
+        # want a guide entry for the duration of cleanup so clients don't
+        # briefly lose their programme. Use the channel's display name +
+        # EPGData name as the fallback title.
+        for epg_source in epg_sources:
+            channels = (
+                Channel.objects
+                .filter(epg_data__epg_source=epg_source)
+                .only("id", "name", "channel_number", "tvg_id")
+            )
+            for ch in channels:
+                tvg = self._entry_tvg_id(
+                    ch.tvg_id or ch.channel_number
+                )
+                if not tvg or tvg in grouped:
+                    continue
+                grouped[tvg] = {
+                    "tvg_id": tvg,
+                    "channel_id": ch.id,
+                    "channel_number": ch.channel_number,
+                    "channel_name": getattr(ch, "name", None) or "YouTube",
+                    "title": getattr(ch, "name", None) or "Live stream",
+                    "description": getattr(ch, "name", None) or "Live stream",
+                    "icon_url": "",
+                    "youtube_video_id": None,
+                    "youtube_channel_id": None,
+                    "live": False,
+                    "source": "existing_channel",
+                }
+
+        return list(grouped.values())
+
+    def _upsert_db(self, entries: List[Dict[str, Any]]) -> Dict[str, int]:
+        """Mirror Twitcharr's ``upsert_db`` exactly — atomic DB write per refresh.
+
+        For each entry:
+          * update_or_create EPGData keyed by ``(tvg_id, epg_source)``
+          * (after per-entry EPGData updates) wipe and bulk_create
+            ProgramData so the guide is always current
+          * link any pre-existing Channel rows via .update() — no save(),
+            no post_save signal
+
+        Returns a small report dict (channels, programmes,
+        linked_channels) for logging / status display.
+        """
+        if not entries:
+            return {"channels": 0, "programmes": 0, "linked_channels": 0}
+
+        from django.db import transaction
+        from django.utils import timezone as djtz
+
+        # Group entries by EPGSource so a single XMLTV source per template
+        # value shares one (tvg_id, epg_source) lookup.
+        per_source: Dict[int, List[Dict[str, Any]]] = {}
+        for e in entries:
+            epg_source_name = (
+                e.get("epg_source_name")
+                or self._channel_group_default_epg_source_name()
+            )
+            epg_source, _ = EPGSource.objects.get_or_create(
+                name=epg_source_name,
+                defaults={"source_type": "xmltv", "is_active": True},
+            )
+            # Drift-only migration: keep this site's xmltv+file_path intact
+            # (Twitcharr's get_or_create_epg_source does the same).
+            desired_file_path = self._xmltv_path(epg_source.id, e.get("_settings"))
+            drift: List[str] = []
+            if epg_source.source_type != "xmltv":
+                epg_source.source_type = "xmltv"
+                drift.append("source_type")
+            if epg_source.file_path != desired_file_path:
+                epg_source.file_path = desired_file_path
+                drift.append("file_path")
+            if drift:
+                epg_source.save(update_fields=drift)
+            per_source.setdefault(epg_source.id, []).append(e)
+
+        total_channels = 0
+        total_programmes = 0
+        total_linked = 0
+
+        with transaction.atomic():
+            for epg_source_id, source_entries in per_source.items():
+                epg_source = EPGSource.objects.get(id=epg_source_id)
+                now = djtz.now()
+                seen_tvg: set = set()
+
+                # Per-entry EPGData update_or_create.
+                epg_rows: Dict[str, Any] = {}
+                for e in source_entries:
+                    tvg = e["tvg_id"]
+                    seen_tvg.add(tvg)
+                    epg, _ = EPGData.objects.update_or_create(
+                        tvg_id=tvg,
+                        epg_source=epg_source,
+                        defaults={
+                            "name": e.get("channel_name")
+                                    or e.get("title")
+                                    or "YouTube Live",
+                            "icon_url": (e.get("icon_url") or "")[:500] or None,
+                        },
+                    )
+                    epg_rows[tvg] = epg
+                    total_channels += 1
+
+                # Wipe + bulk_create ProgramData (Twitcharr line for line).
+                # We do a focused wipe (only this source's EPGData rows)
+                # so a stray ProgramData row from another plugin doesn't
+                # vanish.
+                if epg_rows:
+                    ProgramData.objects.filter(
+                        epg__in=list(epg_rows.values())
+                    ).delete()
+                    new_programs = []
+                    for e in source_entries:
+                        epg = epg_rows.get(e["tvg_id"])
+                        if not epg:
+                            continue
+                        new_programs.append(self._build_program(e, epg, now))
+                    if new_programs:
+                        ProgramData.objects.bulk_create(
+                            new_programs, batch_size=500
+                        )
+                        total_programmes += len(new_programs)
+
+                # Link Channels via .update() — avoid save() so we don't
+                # re-fire Dispatcharr's post_save chain (Twitcharr comment).
+                for tvg, epg in epg_rows.items():
+                    linked = (
+                        Channel.objects
+                        .filter(
+                            tvg_id=tvg,
+                            streams__custom_properties__owner="youtubearr",
+                        )
+                        .exclude(epg_data_id=epg.id)
+                        .update(epg_data=epg)
+                    )
+                    total_linked += linked
+
+                # Drop EPGData rows for tvg_ids that are no longer in entries
+                # (mirrors Twitcharr's stale cleanup).
+                stale_qs = EPGData.objects.filter(
+                    epg_source=epg_source
+                ).exclude(tvg_id__in=list(seen_tvg))
+                stale_count = stale_qs.count()
+                if stale_count:
+                    stale_qs.delete()
+
+                # Source status — match Twitcharr.
+                epg_source.status = "success"
+                epg_source.last_message = (
+                    f"YouTubearr: refreshed {len(epg_rows)} channels, "
+                    f"{len(new_programs) if epg_rows else 0} programmes"
+                    + (f", linked {total_linked} channels" if total_linked else "")
+                    + (f", removed {stale_count} stale" if stale_count else "")
+                )
+                epg_source.updated_at = now
+                epg_source.save(update_fields=[
+                    "status", "last_message", "updated_at",
+                ])
+
+        return {
+            "channels": total_channels,
+            "programmes": total_programmes,
+            "linked_channels": total_linked,
+        }
+
+    def _build_program(
+        self,
+        entry: Dict[str, Any],
+        epg: Any,
+        now: Any,
+    ) -> Any:
+        """Build a ProgramData instance (not yet persisted).
+
+        Caller is responsible for bulk_create. Mirrors the ProgramData
+        constructor field set Twitcharr uses in ``_program_for_entry``.
+        """
+        # Display window: started in the past, runs +12 hours from "now"
+        # so the new programme is always "currently airing" for clients.
+        started = now
+        end = now + timedelta(hours=12)
+
+        custom_properties = {
+            "live": bool(entry.get("live", True)),
+            "youtube_video_id": entry.get("youtube_video_id") or "",
+            "youtube_channel_id": entry.get("youtube_channel_id") or "",
+        }
+        if entry.get("icon_url"):
+            custom_properties["icon"] = entry["icon_url"]
+
+        return ProgramData(
+            epg=epg,
+            tvg_id=entry["tvg_id"],
+            start_time=started,
+            end_time=end,
+            title=entry.get("title") or "Live stream",
+            sub_title="",
+            description=entry.get("description") or entry.get("title") or "Live stream",
+            custom_properties=custom_properties,
+        )
+
+    def _channel_group_default_epg_source_name(self) -> str:
+        """Fallback EPG source name when entries don't carry one.
+
+        Reads the user-configured EPG Source Name from plugin settings; for
+        the refresh path that's passed in via the ``_settings`` extra on
+        each entry. If unset, falls back to the legacy default.
+        """
+        # We don't have a current-settings accessor on the plugin instance,
+        # so we read from the plugin's persisted settings via the
+        # PluginConfig model that Dispatcharr maintains per plugin.
+        try:
+            from apps.plugins.models import PluginConfig
+            cfg = PluginConfig.objects.filter(plugin=self.name).first()
+            stored = (cfg.settings or {}).get("epg_source_name") if cfg else None
+        except Exception:
+            stored = None
+        return (stored or "YouTube Live").strip()
+
     def _get_custom_m3u_account(self):
         """Return the custom/built-in M3UAccount for stream association.
 
@@ -3759,82 +4039,313 @@ class Plugin:
 
     # --- XMLTV Cache Generation ---
 
-    def _generate_xmltv_cache(self, settings: Dict[str, Any]) -> None:
-        """Generate XMLTV cache file for Jellyfin/external EPG readers.
+    def _xmltv_dir(self, settings: Optional[Dict[str, Any]] = None) -> str:
+        """Directory YouTubearr writes per-source XMLTV files into.
 
-        Jellyfin reads EPG from XMLTV files at /app/media/cached_epg/{source_id}.tmp
-        This generates that file from the EPGData/ProgramData in the database.
+        Default is ``<plugin_dir>/epg/`` — a sibling-of-cookies.txt subfolder
+        that keeps XMLTV output separated from the plugin's other state
+        files. Operators can override via the ``epg_data_dir`` setting in
+        plugin config (set this when XMLTV files should live on a separate
+        disk, a Docker bind-mount that Dispatcharr's container can also read,
+        or anywhere else outside the plugin install dir).
+
+        ``settings`` is the plugin's current settings dict; pass it through
+        so the override is honored even from helpers that don't have it on
+        instance state (e.g. when called for migration of an existing
+        EPGSource that was created before the setting existed).
+        """
+        override = ""
+        if isinstance(settings, dict):
+            override = (settings.get("epg_data_dir") or "").strip()
+        if not override:
+            override = str(self._base_dir / "epg")
+        return (
+            os.path.realpath(override)
+            if os.path.isabs(override)
+            else os.path.abspath(override)
+        )
+
+    def _xmltv_path(
+        self, source_id: int, settings: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Absolute file path to write this plugin's XMLTV file at.
+
+        Lives under ``_xmltv_dir()`` (default ``<plugin_dir>/epg/``). Each
+        EPGSource gets its own file at ``<dir>/youtubearr-<source_id>.xmltv``.
+        Dispatcharr's ``fetch_xmltv`` opens any ``file_path`` that exists, so
+        pointing ``EPGSource.file_path`` at this path just works.
+        """
+        return os.path.join(self._xmltv_dir(settings), f"youtubearr-{source_id}.xmltv")
+
+    def _invalidate_dispatcharr_epg_cache(self, epg_sources: List[EPGSource]) -> None:
+        """Drop Dispatcharr's cached XMLTV streams so a fresh fetch shows up.
+
+        Dispatcharr stores its streamed ``/output/epg`` response in Redis under
+        ``epg_content:*`` for ~5 minutes; without this invalidation a downstream
+        client refresh right after we rewrite the XMLTV file still pulls the
+        previous (placeholder) text. This mirrors the Twitcharr pattern.
+        """
+        if not epg_sources:
+            return
+        try:
+            # django-redis may not be installed; this whole helper is best-effort.
+            from django_redis import get_redis_connection  # type: ignore[import-not-found]
+            redis = get_redis_connection("default")
+        except Exception as exc:
+            # No-op silently if Redis isn't available; the next Dispatcharr
+            # refresh task rebuilds the cache from the XMLTV file.
+            self._log(f"Skipping Redis EPG cache invalidation (no Redis available): {exc}")
+            return
+        deleted = 0
+        for key in redis.scan_iter(match="epg_content:*"):
+            try:
+                redis.delete(key)
+                deleted += 1
+            except Exception:
+                pass
+        if deleted:
+            self._log(f"Invalidated {deleted} Dispatcharr EPG cache entr{'y' if deleted == 1 else 'ies'}")
+
+    def _generate_xmltv_cache(self, settings: Dict[str, Any]) -> None:
+        """Generate XMLTV cache file used by both Jellyfin and Dispatcharr.
+
+        Mirrors Twitcharr's plumbing exactly: gather entries → upsert_db →
+        write xmltv → dispatch refresh → invalidate response cache. Order
+        matters — the XMLTV must be regenerated AFTER upsert_db has populated
+        ProgramData + linked channels, and only then do we ask Dispatcharr
+        to reparse (so Dispatcharr's xmltv parser always sees a file
+        consistent with epg_programdata).
+
+        This function is the single point that runs ``_upsert_db`` on every
+        webhook event. ``_create_stream_and_channel`` and ``_refresh_epg_times``
+        NO LONGER write ProgramData directly — leaving the steady-state
+        write path to ``_upsert_db`` keeps the db ↔ file ↔ epg_programdata
+        triplet lockstep.
         """
         epg_source_name_template = settings.get("epg_source_name", "YouTube Live").strip()
         if not epg_source_name_template:
             return
 
-        # If the template contains placeholders, discover all EPG sources associated with
-        # channels in our group rather than looking up a single static name. Each resolved
-        # placeholder (e.g. "{channel} Live" → "NASA Live", "SpaceX Live") creates a separate
-        # EPGSource, and each gets its own XMLTV cache file.
+        # Discover every EPGSource involved: placeholders create one source
+        # per resolved name, the static case uses one source row. Either way
+        # we end up with a list to gate generation on.
         if "{title}" in epg_source_name_template or "{channel}" in epg_source_name_template:
             group_name = settings.get("channel_group_name", self._channel_group_name)
             try:
                 group = ChannelGroup.objects.get(name=group_name)
-                epg_sources = list(EPGSource.objects.filter(
-                    epgdata__channel__channel_group=group
-                ).distinct())
+                epg_sources = list(
+                    EPGSource.objects.filter(
+                        epgdata__channel__channel_group=group
+                    ).distinct()
+                )
             except ChannelGroup.DoesNotExist:
                 return
             if not epg_sources:
                 return
         else:
-            try:
-                epg_sources = [EPGSource.objects.get(name=epg_source_name_template)]
-            except EPGSource.DoesNotExist:
-                self._log(f"EPG source '{epg_source_name_template}' not found, skipping cache generation")
-                return
-
-        def escape_xml(s: str) -> str:
-            if not s:
-                return ""
-            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+            # Static case: ensure the source exists before passing it in,
+            # otherwise ``_gather_youtube_entries`` finds nothing to do.
+            epg_source, _ = EPGSource.objects.get_or_create(
+                name=epg_source_name_template,
+                defaults={"source_type": "xmltv", "is_active": True},
+            )
+            desired_file_path = self._xmltv_path(epg_source.id, settings)
+            drift: List[str] = []
+            if epg_source.source_type != "xmltv":
+                epg_source.source_type = "xmltv"
+                drift.append("source_type")
+            if epg_source.file_path != desired_file_path:
+                epg_source.file_path = desired_file_path
+                drift.append("file_path")
+            if drift:
+                epg_source.save(update_fields=drift)
+            epg_sources = [epg_source]
 
         try:
+            entries = self._gather_youtube_entries(epg_sources, settings)
+            upsert_report = self._upsert_db(entries)
+            self._log(
+                f"upsert_db: {upsert_report['channels']} channels, "
+                f"{upsert_report['programmes']} programmes, "
+                f"{upsert_report['linked_channels']} channels linked"
+            )
+
+            cache_dir = self._xmltv_dir(settings)
+            os.makedirs(cache_dir, exist_ok=True)
+
+            written_sources: List[EPGSource] = []
             for epg_source in epg_sources:
-                cache_path = f"/app/media/cached_epg/{epg_source.id}.tmp"
-                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                # Group entries to this source for the writer.
+                # With a single static source name, this is all entries;
+                # with placeholders, the writer gets entries for the EPGSource
+                # whose name matches the entry's resolved template.
+                source_entries = [
+                    e for e in entries if self._entry_resolves_to_source(e, epg_source, epg_source_name_template)
+                ]
+                cache_path = self._xmltv_path(epg_source.id, settings)
+                if self._write_xmltv_from_entries(epg_source, source_entries, cache_path):
+                    written_sources.append(epg_source)
 
-                with open(cache_path, "w", encoding="utf-8") as f:
-                    f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-                    f.write('<tv generator-info-name="YouTubearr Plugin">\n')
+            if not written_sources:
+                self._log(
+                    "No XMLTV files written (no entries matched any EPGSource)."
+                )
+                return
 
-                    # Write channels
-                    for epg in EPGData.objects.filter(epg_source=epg_source):
-                        name = escape_xml(epg.name)
-                        f.write(f'  <channel id="{epg.tvg_id}">\n')
-                        f.write(f'    <display-name>{name}</display-name>\n')
-                        if epg.icon_url:
-                            f.write(f'    <icon src="{escape_xml(epg.icon_url)}"/>\n')
-                        f.write('  </channel>\n')
+            # After the file is on disk, ask Dispatcharr to re-parse it.
+            self._dispatcharr_refresh_epg(written_sources)
 
-                    # Write programs
-                    count = 0
-                    for prog in ProgramData.objects.filter(epg__epg_source=epg_source).select_related("epg"):
-                        start = prog.start_time.strftime("%Y%m%d%H%M%S +0000")
-                        stop = prog.end_time.strftime("%Y%m%d%H%M%S +0000")
-                        title = escape_xml(prog.title or "")
-                        desc = escape_xml((prog.description or "")[:500])
-
-                        f.write(f'  <programme start="{start}" stop="{stop}" channel="{prog.epg.tvg_id}">\n')
-                        f.write(f'    <title>{title}</title>\n')
-                        if desc:
-                            f.write(f'    <desc>{desc}</desc>\n')
-                        f.write('  </programme>\n')
-                        count += 1
-
-                    f.write('</tv>\n')
-
-                self._log(f"XMLTV cache generated: {count} programs at {cache_path}")
-
+            # Bust Dispatcharr's streamed /output/epg response cache so the
+            # NEXT client fetch reflects the new titles immediately.
+            self._invalidate_dispatcharr_epg_cache(written_sources)
         except Exception as e:
             self._log_error(f"Failed to generate XMLTV cache: {e}")
+
+    def _entry_resolves_to_source(
+        self,
+        entry: Dict[str, Any],
+        epg_source: EPGSource,
+        epg_source_name_template: str,
+    ) -> bool:
+        """Map an entry to the EPGSource it should serialize under.
+
+        With placeholders, ``epg_source_name`` would carry the resolved
+        template value if we set it during gathering. Today entries come
+        from ``tracked_streams`` which has no template metadata, so we
+        use the simple rule: static template → all entries belong to the
+        single source; placeholder template → entries without a per-source
+        name belong to the source we passed in for this iteration.
+        """
+        if "{" not in epg_source_name_template:
+            return True
+        return entry.get("epg_source_name") in (None, epg_source.name)
+
+    def _dispatcharr_refresh_epg(self, epg_sources: List[EPGSource]) -> None:
+        """Trigger Dispatcharr's xmltv parse against each freshly-written file.
+
+        ``refresh_epg_data`` is ``apps.epg.tasks.refresh_epg_data`` — the
+        same Celery task Dispatcharr's UI "Refresh" button calls. It calls
+        ``fetch_xmltv(source)``, then ``parse_channels_only`` and
+        ``parse_programs_for_source``, which read ``source.file_path`` and
+        replace ``epg_epgdata`` + ``epg_programdata`` rows. The ``xmltv``
+        branch in Dispatcharr's ``refresh_epg_data`` honors ``file_path``
+        with no URL set (see ``apps/epg/tasks.py::fetch_xmltv``).
+        """
+        if not epg_sources:
+            return
+        try:
+            from apps.epg.tasks import refresh_epg_data
+        except Exception as exc:
+            # Older Dispatcharr builds may not export the task symbol by that
+            # name; fall back to the long-form path. Skip with a clear log if
+            # neither resolves — the periodic Dispatcharr scheduler will still
+            # catch up within its next refresh window.
+            try:
+                from importlib import import_module
+                mod = import_module("apps.epg.tasks")
+                refresh_epg_data = getattr(mod, "refresh_epg_data", None) or getattr(
+                    mod, "refresh_epg_data_task", None
+                )
+                if refresh_epg_data is None:
+                    raise RuntimeError("refresh_epg_data not found in apps.epg.tasks")
+            except Exception as nested_exc:
+                self._log(
+                    f"Could not import Dispatcharr refresh_epg_data; skipping EPG parse trigger "
+                    f"({exc}; {nested_exc}). Dispatcharr's periodic refresh will catch up."
+                )
+                return
+        try:
+            for epg_source in epg_sources:
+                try:
+                    refresh_epg_data.delay(epg_source.id, force=True)
+                except Exception as delay_exc:
+                    self._log_error(
+                        f"Could not dispatch refresh_epg_data for source {epg_source.id}: {delay_exc}"
+                    )
+        except Exception as exc:
+            self._log_error(f"Unexpected error dispatching refresh_epg_data: {exc}")
+
+    def _write_xmltv_from_entries(
+        self,
+        epg_source: EPGSource,
+        entries: List[Dict[str, Any]],
+        cache_path: str,
+    ) -> bool:
+        """Atomically write the XMLTV document from in-memory entries.
+
+        Mirrors Twitcharr's ``write_xmltv``: builds the document in memory
+        first, then atomically swaps it onto ``cache_path``. The file content
+        always matches what ``_upsert_db`` just wrote to ProgramData, so
+        Dispatcharr's downstream xmltv parse sees a consistent picture.
+
+        Returns True if the file ended up on disk, False on any failure.
+        """
+        try:
+            os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        except Exception as mkdir_exc:
+            self._log_error(f"Could not create XMLTV cache dir: {mkdir_exc}")
+            return False
+
+        from xml.etree.ElementTree import Element, SubElement, ElementTree
+
+        tv = Element("tv", {
+            "generator-info-name": "YouTubearr Plugin",
+            "generator-info-url": "https://github.com/jeff-gooch/youtubearr",
+        })
+
+        now = timezone.now()
+        channels_written = 0
+        programmes_written = 0
+
+        for e in entries:
+            tvg = e["tvg_id"]
+            ch_el = SubElement(tv, "channel", {"id": tvg})
+            channel_name = e.get("channel_name") or e.get("title") or "YouTube Live"
+            SubElement(ch_el, "display-name").text = channel_name
+            if e.get("icon_url"):
+                SubElement(ch_el, "icon", {"src": e["icon_url"]})
+            channels_written += 1
+
+            started = now
+            ended = now + timedelta(hours=12)
+            prog_el = SubElement(tv, "programme", {
+                "start": started.strftime("%Y%m%d%H%M%S +0000"),
+                "stop": ended.strftime("%Y%m%d%H%M%S +0000"),
+                "channel": tvg,
+            })
+            SubElement(prog_el, "title").text = e.get("title") or "Live stream"
+            if e.get("description"):
+                SubElement(prog_el, "desc").text = (e["description"] or "")[:500]
+            if e.get("icon_url"):
+                SubElement(prog_el, "icon", {"src": e["icon_url"]})
+            programmes_written += 1
+
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                prefix=f"youtubearr-{epg_source.id}-",
+                suffix=".xml",
+                dir=os.path.dirname(cache_path) or ".",
+            )
+            try:
+                with os.fdopen(tmp_fd, "wb") as f:
+                    f.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
+                    ElementTree(tv).write(f, encoding="utf-8", xml_declaration=False)
+                os.replace(tmp_path, cache_path)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception as write_exc:
+            self._log_error(f"Failed to write XMLTV cache for source {epg_source.id}: {write_exc}")
+            return False
+
+        self._log(
+            f"XMLTV cache written: {programmes_written} programmes / "
+            f"{channels_written} channels at {cache_path}"
+        )
+        return True
 
     # --- Webhook / Notification ---
 

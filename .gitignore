@@ -4,3 +4,6 @@ claude.md
 *.pyc
 __pycache__/
 youtubearr.log
+
+# Build artifacts (not source)
+/youtubearr-*.zip
