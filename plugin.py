@@ -4211,7 +4211,21 @@ class Plugin:
             defaults={"source_type": "xmltv", "is_active": True},
         )
 
-        # Drift-only migration: keep this row's xmltv+file_path intact.
+        # 1b. BULLETPROOF: Re-point EVERY xmltv-type EPGSource row at the
+        # operator's configured data dir. This catches rows that were
+        # created on older paths where the drift-only save fired before
+        # ``epg_data_dir`` was set in the user's config. Idempotent — a
+        # row that already has the right path just hits the inequality
+        # check and skips the save.
+        try:
+            self._force_xmltv_data_dir(settings, exclude_ids={target_source.id})
+        except Exception as force_exc:
+            self._log_error(f"Bulk file_path correction warning: {force_exc}")
+
+        # Drift-only migration on the operator's configured source too —
+        # the bulk sweep above handles "everything except the target",
+        # this handles the target itself in case the bulk sweep raced
+        # or the target was already correct (no-op then).
         desired_file_path = self._xmltv_path(target_source.id, settings)
         drift: List[str] = []
         if target_source.source_type != "xmltv":
@@ -4306,6 +4320,154 @@ class Plugin:
                 f"Migrated {reassigned_eps} channel(s) from "
                 f"'{legacy.name}' → '{target_source.name}'"
             )
+
+    def _force_xmltv_data_dir(
+        self,
+        settings: Dict[str, Any],
+        exclude_ids: Optional[set] = None,
+    ) -> int:
+        """Re-point YouTubearr-managed EPGSource rows at the configured data dir.
+
+        Ownership is determined by **source-name match**, not channel
+        linkage — because the channel linkage is built lazily on the
+        next stream event, and the very situation this sweep exists to
+        fix (a broken ``file_path`` preventing Dispatcharr from
+        parsing) leaves channels unlinked.
+
+        A source is considered YouTubearr-managed if its ``name`` is
+        one of:
+          * the operator's configured ``epg_source_name`` (without
+            placeholders), OR
+          * the configured name with ``{title}``/``{channel}``
+            placeholders resolved against the YouTube channel name
+            of a stream in ``tracked_streams``.
+
+        EPGSources whose names don't match anything YouTubearr would
+        have created are left alone — they belong to other plugins or
+        were operator-created intentionally.
+
+        Idempotent: a row whose path is already correct just hits the
+        inequality check and skips the save. Safe to call on every
+        plugin action — ``update_fields=["file_path"]`` only fires when
+        an actual change is made.
+
+        If the operator did NOT set ``epg_data_dir`` (or set it to an
+        empty string), the function returns immediately — the default
+        ``<plugin_dir>/epg/`` is the right answer in that case.
+
+        ``exclude_ids`` lets callers skip specific rows already handled
+        in a more targeted path (e.g. the operator's configured name,
+        which the legacy-rename sweep handles directly).
+        """
+        try:
+            from apps.epg.models import EPGSource
+        except ImportError:
+            return 0
+
+        override = (settings.get("epg_data_dir") or "").strip()
+        if not override:
+            return 0
+        desired_dir = (
+            os.path.realpath(override)
+            if os.path.isabs(override)
+            else os.path.abspath(override)
+        )
+
+        exclude_ids = exclude_ids or set()
+
+        # Build the set of EPGSource names this plugin owns.
+        yt_owned_source_names = self._youtubearr_owned_epg_source_names(settings)
+
+        if not yt_owned_source_names:
+            return 0
+
+        corrected = 0
+        for src in (
+            EPGSource.objects
+            .filter(source_type="xmltv", name__in=yt_owned_source_names)
+            .only("id", "name", "file_path")
+        ):
+            if src.id in exclude_ids:
+                continue
+            desired_path = os.path.join(
+                desired_dir, f"youtubearr-{src.id}.xmltv"
+            )
+            if src.file_path != desired_path:
+                old_path = src.file_path
+                src.file_path = desired_path
+                src.save(update_fields=["file_path"])
+                self._log(
+                    f"[_force_xmltv_data_dir] Re-pointed EPGSource "
+                    f"id={src.id} ({src.name!r}) file_path: "
+                    f"{old_path!r} → {desired_path!r}"
+                )
+                corrected += 1
+
+        if corrected:
+            self._log(
+                f"[_force_xmltv_data_dir] Re-pointed {corrected} "
+                f"YouTubearr-managed EPGSource row(s) to {desired_dir}"
+            )
+        return corrected
+
+    def _youtubearr_owned_epg_source_names(
+        self,
+        settings: Dict[str, Any],
+    ) -> set:
+        """Return the set of EPGSource names this plugin could have created.
+
+        Computed purely from configuration + live tracked_streams — no
+        DB queries against EPGSource itself, so the result does not
+        depend on the EPGSource rows being correctly populated. The
+        caller matches this set against ``EPGSource.name`` via
+        ``name__in=...``.
+        """
+        names: set = set()
+        template = (settings.get("epg_source_name") or "").strip()
+        # Also account for operators who never overrode the plugin
+        # default (so the field is empty in PluginConfig) — those rows
+        # would have been created under EPG_SOURCE_NAME.
+        candidates_to_resolve = set()
+        if template:
+            candidates_to_resolve.add(template)
+        candidates_to_resolve.add(EPG_SOURCE_NAME)
+        # Empty settings (no operator override anywhere) → only the
+        # plugin-default name.
+        if not template:
+            candidates_to_resolve.discard("")
+        for name in candidates_to_resolve:
+            if not name:
+                continue
+            if "{" not in name:
+                names.add(name)
+                continue
+            # Placeholder template — resolve {title}/{channel} against
+            # the live YouTube channels YouTubearr is currently
+            # tracking. We only include names for streams that exist,
+            # not hypothetical ones; orphan placeholder sources left
+            # over from previous lifecycle are still matched (they
+            # already have the right name by definition).
+            for stream_data in (
+                (settings.get("tracked_streams") or {}).values()
+            ):
+                if not isinstance(stream_data, dict):
+                    continue
+                yt_ch = (
+                    stream_data.get("youtube_channel_name")
+                    or stream_data.get("channel_name")
+                )
+                video_title = stream_data.get("title")
+                resolved = name.replace("{channel}", yt_ch or "")
+                if video_title:
+                    resolved = resolved.replace("{title}", video_title)
+                # Also resolve the case where {title} isn't a literal
+                # substitution but a regex placeholder — leave it as
+                # the unresolved name; live tracked_streams never has
+                # a literal value that matches a regex in name.
+                if "{" in resolved:
+                    continue
+                names.add(resolved)
+        return names
 
     def _channel_group_default_epg_source_name(self) -> str:
         """Fallback EPG source name when entries don't carry one.
