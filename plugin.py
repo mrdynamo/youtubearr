@@ -389,6 +389,31 @@ class Plugin:
             settings.update(params)
         context["settings"] = settings
 
+        # One-shot legacy EPG source migration. Older plugin versions
+        # created an EPGSource named "YouTube Live" by default; operators
+        # upgrading may have changed the configured setting to e.g.
+        # "YouTube (managed by YouTubearr)", but the old source row and
+        # its EPGData/Channel links remain. Without this sweep, two
+        # parallel sources accumulate: the operator's new one for
+        # freshly-detected streams, and the legacy one holding every
+        # channel that was created before the rename.
+        #
+        # We collapse both into the operator's configured name by:
+        #  1. resolving the operator's configured EPGSource row (creating
+        #     it if absent)
+        #  2. reassigning every EPGData on legacy sources to it via
+        #     raw UPDATE (no save(), so we don't trip post_save chains)
+        #  3. reassigning every Channel.epg_data FK (and tvg_id) to the
+        #     matching new EPGData row
+        #  4. deleting the now-empty legacy EPGSource rows.
+        # Safe to run every action — no-ops once the migration is done.
+        try:
+            self._migrate_legacy_epg_sources(settings)
+        except Exception as migrate_exc:
+            self._log_error(
+                f"Legacy EPG source migration warning: {migrate_exc}"
+            )
+
         # Keep the plugin-owned cookies.txt sidecar aligned with current settings
         # on the normal plugin run/save/status path, not only when a stream is created
         # or refreshed.
@@ -3948,7 +3973,11 @@ class Plugin:
 
         return list(grouped.values())
 
-    def _upsert_db(self, entries: List[Dict[str, Any]]) -> Dict[str, int]:
+    def _upsert_db(
+        self,
+        entries: List[Dict[str, Any]],
+        settings: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, int]:
         """Mirror Twitcharr's ``upsert_db`` exactly — atomic DB write per refresh.
 
         For each entry:
@@ -3958,11 +3987,26 @@ class Plugin:
           * link any pre-existing Channel rows via .update() — no save(),
             no post_save signal
 
+        ``settings`` carries the operator's ``epg_data_dir`` override
+        (and any future tunables). It is used to compute each
+        ``EPGSource.file_path`` so the row points at the same directory
+        the XMLTV cache writer uses — they MUST agree, otherwise
+        Dispatcharr's xmltv parser reads from a different path than the
+        one we write to. Earlier this code read ``e.get("_settings")``
+        which is always None because ``_gather_youtube_entries`` does not
+        stamp the settings dict onto each entry — that was the bug
+        that left EPG entries pointing at the default ``<plugin_dir>/epg/``
+        even when the operator had configured an override.
+
         Returns a small report dict (channels, programmes,
         linked_channels) for logging / status display.
         """
         if not entries:
             return {"channels": 0, "programmes": 0, "linked_channels": 0}
+        # _settings on each entry is intentionally not consulted — see
+        # the docstring note above. The canonical source for the data-dir
+        # override is the explicit ``settings`` parameter, which has
+        # always been the live PluginConfig blob at the call site.
 
         from django.db import transaction
         from django.utils import timezone as djtz
@@ -3980,8 +4024,13 @@ class Plugin:
                 defaults={"source_type": "xmltv", "is_active": True},
             )
             # Drift-only migration: keep this site's xmltv+file_path intact
-            # (Twitcharr's get_or_create_epg_source does the same).
-            desired_file_path = self._xmltv_path(epg_source.id, e.get("_settings"))
+            # (Twitcharr's get_or_create_epg_source does the same). Crucially,
+            # this computes the path from the *real* ``settings`` parameter —
+            # ``_gather_youtube_entries`` does NOT stamp `_settings` on each
+            # entry, so reading it here used to silently fall back to the
+            # default ``<plugin_dir>/epg/`` even when the operator set an
+            # ``epg_data_dir`` override. See the ``_upsert_db`` docstring.
+            desired_file_path = self._xmltv_path(epg_source.id, settings)
             drift: List[str] = []
             if epg_source.source_type != "xmltv":
                 epg_source.source_type = "xmltv"
@@ -4117,6 +4166,146 @@ class Plugin:
             description=entry.get("description") or entry.get("title") or "Live stream",
             custom_properties=custom_properties,
         )
+
+    def _migrate_legacy_epg_sources(self, settings: Dict[str, Any]) -> None:
+        """Collapse legacy "YouTube Live" EPGSource rows onto the operator's
+        configured EPGSource.
+
+        Older YouTubearr versions created an EPGSource named ``"YouTube Live"``
+        (the v1.12.2 default). Operators who later changed the
+        ``epg_source_name`` setting were left with **two** sources:
+        ``"YouTube Live"`` (legacy, holding every channel linked before
+        the rename) and the operator's new name (newly-detected
+        streams). My drift-only migration in
+        ``_create_stream_and_channel`` updates an existing row in-place
+        when its name matches the configured setting, but never renamed
+        a legacy row that didn't.
+
+        This helper runs at the start of every plugin action via
+        ``Plugin.run``. It is deliberately idempotent — once the rename
+        is done it is a no-op. It uses ``UPDATE`` (never ``.save()``) so
+        ``Channel``/``EPGData`` ``post_save`` signals don't fire across
+        the Dispatcharr worker fleet mid-action.
+        """
+        try:
+            from apps.epg.models import EPGData, ProgramData, EPGSource
+            from django.db.models import Q
+        except ImportError:
+            return
+
+        # The operator's current configured name. Placeholders do NOT
+        # apply here — legacy renaming is for the *static* source, which
+        # is the row that was historically called "YouTube Live". If the
+        # operator uses {title} or {channel} placeholders, those sources
+        # are per-channel/per-stream and have no legacy counterpart to
+        # migrate from.
+        epg_source_name = settings.get("epg_source_name") or ""
+        epg_source_name = epg_source_name.strip()
+        if not epg_source_name or "{" in epg_source_name:
+            return
+
+        # 1. Make sure the operator's configured source exists at all
+        # (matters on the very first run after they renamed the setting).
+        target_source, _ = EPGSource.objects.get_or_create(
+            name=epg_source_name,
+            defaults={"source_type": "xmltv", "is_active": True},
+        )
+
+        # Drift-only migration: keep this row's xmltv+file_path intact.
+        desired_file_path = self._xmltv_path(target_source.id, settings)
+        drift: List[str] = []
+        if target_source.source_type != "xmltv":
+            target_source.source_type = "xmltv"
+            drift.append("source_type")
+        if target_source.file_path != desired_file_path:
+            target_source.file_path = desired_file_path
+            drift.append("file_path")
+        if drift:
+            target_source.save(update_fields=drift)
+
+        # 2. Find legacy EPGSources — any source row that isn't the
+        # operator's configured name AND isn't one of the per-channel/
+        # per-stream sources the placeholders generate. We exclude the
+        # canonical name itself, plus any source whose name resolves to
+        # a still-live entry (those are real, leave alone).
+        live_placeholder_names: set = set()
+        tracked_streams = (settings or {}).get("tracked_streams", {}) or {}
+        for stream_data in tracked_streams.values():
+            if isinstance(stream_data, dict) and stream_data.get("is_live"):
+                yt_ch = (
+                    stream_data.get("youtube_channel_name")
+                    or stream_data.get("channel_name")
+                )
+                if yt_ch:
+                    live_placeholder_names.add(f"{yt_ch} Live")
+
+        legacy_qs = EPGSource.objects.exclude(
+            Q(id=target_source.id) | Q(name__in=live_placeholder_names)
+        )
+        # We migrate only sources whose name is one of the historical
+        # "fixed-name" defaults. Don't rename unknown operator-created
+        # sources — that could collide with their other plugins.
+        legacy_names = {"YouTube Live"}  # historical YouTubearr default
+        legacy_qs = legacy_qs.filter(name__in=legacy_names)
+        if not legacy_qs.exists():
+            return
+
+        for legacy in legacy_qs:
+            if legacy.id == target_source.id:
+                continue
+            self._log(
+                f"Migrating legacy EPGSource '{legacy.name}' → "
+                f"'{target_source.name}'"
+            )
+
+            # 3. Move every EPGData row. We do this in raw UPDATE so we
+            # don't fire the EPGData post_save chain (which would queue
+            # parse_programs_for_tvg_id per row).
+            epg_data_qs = list(
+                EPGData.objects.filter(epg_source=legacy).only("id", "tvg_id")
+            )
+            target_epgdata_map: Dict[str, EPGData] = {}
+            for ed in EPGData.objects.filter(
+                epg_source=target_source, tvg_id__in=[e.tvg_id for e in epg_data_qs]
+            ):
+                target_epgdata_map[ed.tvg_id] = ed
+
+            reassigned_eps = 0
+            for ed in epg_data_qs:
+                target_ed = target_epgdata_map.get(ed.tvg_id)
+                if target_ed is None:
+                    # No matching row on the target side — create one
+                    # carrying the same tvg_id/name so dispatcharr
+                    # keeps the linkage stable.
+                    EPGData.objects.filter(
+                        epg_source=target_source, tvg_id=ed.tvg_id
+                    ).delete()
+                    ed.epg_source = target_source
+                    ed.save(update_fields=["epg_source"])
+                    target_epgdata_map[ed.tvg_id] = ed
+                    reassigned_eps += 1
+                    continue
+                # Reassign all ProgramData rows from the legacy EPGData
+                # to the target EPGData (same tvg_id). Use raw UPDATE.
+                ProgramData.objects.filter(epg_id=ed.id).update(
+                    epg_id=target_ed.id
+                )
+                # Now point Channels with tvg_id=tvg at target_ed. The
+                # FK lives in the Channel row's epg_data_id column.
+                Channel.objects.filter(
+                    epg_data_id=ed.id
+                ).update(epg_data_id=target_ed.id)
+                # Drop the legacy EPGData row (its programmes were
+                # reassigned above).
+                EPGData.objects.filter(id=ed.id).delete()
+                reassigned_eps += 1
+
+            # 4. Delete the now-empty legacy source row.
+            EPGSource.objects.filter(id=legacy.id).delete()
+            self._log(
+                f"Migrated {reassigned_eps} channel(s) from "
+                f"'{legacy.name}' → '{target_source.name}'"
+            )
 
     def _channel_group_default_epg_source_name(self) -> str:
         """Fallback EPG source name when entries don't carry one.
@@ -4283,7 +4472,7 @@ class Plugin:
 
         try:
             entries = self._gather_youtube_entries(epg_sources, settings)
-            upsert_report = self._upsert_db(entries)
+            upsert_report = self._upsert_db(entries, settings=settings)
             self._log(
                 f"upsert_db: {upsert_report['channels']} channels, "
                 f"{upsert_report['programmes']} programmes, "
