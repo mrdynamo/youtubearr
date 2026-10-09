@@ -35,6 +35,14 @@ PROBE_STATUS_EMPTY_UNKNOWN = "empty/unknown status"
 PROBE_STATUS_BOT_AUTH = "bot/auth failure"
 
 
+# Canonical EPG source name. Mirrors Twitcharr's
+# `EPG_SOURCE_NAME = "Twitch (managed by Twitcharr)"` — used as the default
+# in the plugin's settings schema and as the fallback in every
+# `.get("epg_source_name", ...)` lookup, so operators get one consistent
+# "managed by YouTubearr" source row instead of "YouTube Live".
+EPG_SOURCE_NAME = "YouTube (managed by YouTubearr)"
+
+
 class Plugin:
     name = "YouTubearr"
     version = "1.40.1"
@@ -220,7 +228,7 @@ class Plugin:
             "id": "epg_source_name",
             "label": "EPG Source Name",
             "type": "string",
-            "default": "YouTube Live",
+            "default": EPG_SOURCE_NAME,
             "help_text": "Name for the EPG source YouTubearr creates in Dispatcharr. Auto-created if it doesn't exist. Leave empty to skip EPG assignment. Supports {title} (video title) and {channel} (YouTube channel name) placeholders — e.g. '{channel} Live' creates a separate EPG source per YouTube channel. Note: {title} creates one source per individual stream.",
         },
         {
@@ -980,25 +988,62 @@ class Plugin:
             except ChannelGroup.DoesNotExist:
                 channel_group = None
 
-            # Step 5: Delete all channels in the YouTube Live group
+            # Step 5: Delete ONLY YouTubearr-managed channels in the group.
+            #
+            # "Managed by YouTubearr" = Channel has at least one Stream whose
+            # custom_properties carries owner="youtubearr" (stamped at
+            # _create_stream_and_channel time). Filtering on this is the same
+            # predicate Twitcharr uses for its Channel.link step, and ensures
+            # we never touch Channels / Streams the operator (or another
+            # plugin) created in the same group. The previous implementation
+            # selected Channel.objects.filter(channel_group=channel_group)
+            # with no ownership filter and wiped everything in the group,
+            # including unrelated plugins' work.
             channels_deleted = 0
             streams_deleted = 0
+            yt_owned_stream_ids: List[int] = []
 
             if channel_group:
-                channels = Channel.objects.filter(channel_group=channel_group)
-                channels_deleted = channels.count()
+                yt_owned_channels = (
+                    Channel.objects
+                    .filter(
+                        channel_group=channel_group,
+                        streams__custom_properties__owner="youtubearr",
+                    )
+                    .distinct()
+                )
+                # Collect the YouTubearr-owned Stream ids so we can report
+                # exactly what we removed — channel.streams.all() includes
+                # any streams the operator may have added manually to the
+                # channel post-creation; we do NOT touch those.
+                yt_owned_stream_ids = list(
+                    Stream.objects
+                    .filter(
+                        channelstream__channel__in=yt_owned_channels,
+                        custom_properties__owner="youtubearr",
+                    )
+                    .values_list("id", flat=True)
+                )
+                streams_deleted = len(yt_owned_stream_ids)
+                channels_deleted = yt_owned_channels.count()
 
-                # Get associated streams before deleting channels
-                for channel in channels:
-                    for stream in channel.streams.all():
-                        streams_deleted += 1
-                        stream.delete()
+                # Delete the YouTubearr-owned streams explicitly. Their
+                # ChannelStream join rows go with them. Then delete the
+                # channels; if any non-owned streams remain attached,
+                # Channel.delete() leaves them in place (no cascade).
+                if yt_owned_stream_ids:
+                    Stream.objects.filter(id__in=yt_owned_stream_ids).delete()
+                for channel in yt_owned_channels:
                     channel.delete()
 
-                self._log(f"Reset All: Deleted {channels_deleted} channel(s) and {streams_deleted} stream(s)")
+                self._log(
+                    f"Reset All: Deleted {channels_deleted} YouTubearr-managed "
+                    f"channel(s) and {streams_deleted} YouTubearr-managed stream(s) "
+                    f"(non-managed items in the '{group_name}' group left untouched)"
+                )
 
             # Step 6: Clean up EPG data for this plugin's EPG source
-            epg_source_name = context.get("settings", {}).get("epg_source_name", "YouTube Live").strip()
+            epg_source_name = context.get("settings", {}).get("epg_source_name", EPG_SOURCE_NAME).strip()
             epg_cleaned = 0
             if epg_source_name:
                 try:
@@ -1316,7 +1361,7 @@ class Plugin:
             return f"unavailable: {type(exc).__name__}"
 
     def _get_epg_counts(self, settings: Dict[str, Any]) -> Dict[str, Any]:
-        epg_source_name = settings.get("epg_source_name", "YouTube Live").strip()
+        epg_source_name = settings.get("epg_source_name", EPG_SOURCE_NAME).strip()
         result: Dict[str, Any] = {}
         try:
             source = EPGSource.objects.filter(name=epg_source_name).first()
@@ -1893,7 +1938,7 @@ class Plugin:
         self._assigned_channel_numbers.add(channel_number)
 
         # Auto-create and assign EPG if configured
-        epg_source_name = settings.get("epg_source_name", "YouTube Live").strip()
+        epg_source_name = settings.get("epg_source_name", EPG_SOURCE_NAME).strip()
         epg_source_name = epg_source_name.replace("{title}", video_title).replace("{channel}", youtube_channel_name)
         if epg_source_name:
             try:
@@ -3318,7 +3363,7 @@ class Plugin:
             # Snapshot EPG sources in the configured group; the cache
             # generator will re-discover them based on settings, but we
             # want a count for the return value here.
-            template = (settings or {}).get("epg_source_name", "YouTube Live").strip()
+            template = (settings or {}).get("epg_source_name", EPG_SOURCE_NAME).strip()
             if not template:
                 return 0
             if "{" in template:
@@ -4014,7 +4059,7 @@ class Plugin:
             stored = (cfg.settings or {}).get("epg_source_name") if cfg else None
         except Exception:
             stored = None
-        return (stored or "YouTube Live").strip()
+        return (stored or EPG_SOURCE_NAME).strip()
 
     def _get_custom_m3u_account(self):
         """Return the custom/built-in M3UAccount for stream association.
@@ -4122,7 +4167,7 @@ class Plugin:
         write path to ``_upsert_db`` keeps the db ↔ file ↔ epg_programdata
         triplet lockstep.
         """
-        epg_source_name_template = settings.get("epg_source_name", "YouTube Live").strip()
+        epg_source_name_template = settings.get("epg_source_name", EPG_SOURCE_NAME).strip()
         if not epg_source_name_template:
             return
 
@@ -4572,7 +4617,7 @@ class Plugin:
         Safe fallback: returns zeros and source_found=False on any DB/import error.
         """
         result: Dict[str, Any] = {"current": 0, "future12": 0, "source_found": False}
-        epg_source_name = settings.get("epg_source_name", "YouTube Live").strip()
+        epg_source_name = settings.get("epg_source_name", EPG_SOURCE_NAME).strip()
         if not epg_source_name:
             return result
         try:
