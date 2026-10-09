@@ -1989,18 +1989,36 @@ class Plugin:
                 # Get or create EPGData entry for this channel.
                 # Use channel_number as tvg_id since Dispatcharr uses channel_number as the ID in EPG XML output.
                 channel_tvg_id = str(channel_number)
+                # EPGData.name mirrors Channel.name EXACTLY so operators
+                # can navigate the EPG grid by the same labels they see in
+                # the channels table. A YouTube channel with multiple
+                # concurrent livestreams produces several Dispatcharr
+                # Channels named "<YouTube Channel> #1", "#2", ... and
+                # each gets its own EPGData row with the matching "#N"
+                # suffix. Using a bare youtube_channel_name here (e.g.
+                # "NASA") would make all of them look identical in the
+                # EPG grid — the same bug that hid the per-channel
+                # distinction in the previous implementation.
+                epg_data_name = channel_name
                 epg_data, data_created = EPGData.objects.get_or_create(
                     tvg_id=channel_tvg_id,
                     epg_source=epg_source_obj,
                     defaults={
-                        "name": video_title,
+                        "name": epg_data_name,
                     }
                 )
                 if data_created:
-                    self._log(f"Created EPG data entry for: {channel_name} (tvg_id={channel_tvg_id})")
+                    self._log(
+                        f"Created EPG data entry: epg_data.name={epg_data_name!r} "
+                        f"for tvg_id={channel_tvg_id}"
+                    )
                 else:
-                    if epg_data.name != video_title:
-                        epg_data.name = video_title
+                    # Drift the EPGData.name only if the Channel's label
+                    # changed (e.g. operator renamed it via Dispatcharr UI,
+                    # or the stream-number count shifted). Never overwrite
+                    # back to the video title.
+                    if epg_data.name != epg_data_name:
+                        epg_data.name = epg_data_name
                         epg_data.save(update_fields=["name"])
 
                 # Assign to channel - set tvg_id to match channel_number for EPG XML output
@@ -3816,6 +3834,21 @@ class Plugin:
         grouped: Dict[str, Dict[str, Any]] = {}
 
         # 1. Live streams YouTubearr knows about right now.
+        #
+        # IMPORTANT: tracked_streams uses the key ``youtube_channel_name``
+        # for the YouTube channel's display name (e.g. "NASA",
+        # "MaxVelocityWX") — NOT ``channel_name`` or ``channel``. The
+        # earlier implementation only checked the latter two keys and
+        # silently fell back to the literal string "YouTube", making
+        # every ProgramData row indistinguishable in the Dispatcharr UI.
+        #
+        # For our EPG display label we mirror Channel.name EXACTLY so the
+        # operators see "<Channel> #1", "<Channel> #2", … in the EPG grid,
+        # matching the names Dispatcharr shows in the channels list.
+        # This is the source of truth — whatever Channel.name holds IS the
+        # label operators use — so we look it up directly rather than
+        # reconstructing "<Channel> #N" from tracked_streams (which would
+        # race with operator renames).
         for video_id, stream_data in tracked_streams.items():
             if not isinstance(stream_data, dict):
                 continue
@@ -3826,16 +3859,56 @@ class Plugin:
             if channel_id is None or channel_number is None:
                 continue
             tvg = self._entry_tvg_id(channel_number)
+
+            # Resolve a usable channel display name. Order of preference:
+            #  1. Channel.objects.get(id=channel_id).name  ← source of truth
+            #     (set by _create_stream_and_channel to
+            #     f"{youtube_channel_name} #{stream_number}")
+            #  2. youtube_channel_name + stream number from tracked_streams
+            #     (covers legacy entries before a Channel row exists)
+            #  3. youtube_channel_name alone
+            #  4. "YouTube Live" — last resort only
+            channel_name: Optional[str] = None
+            try:
+                ch = Channel.objects.only("id", "name").get(id=channel_id)
+                channel_name = getattr(ch, "name", None) or None
+            except Channel.DoesNotExist:
+                channel_name = None
+            if not channel_name:
+                yt_name = (
+                    stream_data.get("youtube_channel_name")
+                    or stream_data.get("channel_name")
+                    or stream_data.get("channel")
+                )
+                if yt_name:
+                    stream_number = stream_data.get("channel_number")
+                    channel_name = (
+                        f"{yt_name} #{stream_number}"
+                        if stream_number is not None
+                        else yt_name
+                    )
+            channel_name = channel_name or "YouTube Live"
+
+            title = stream_data.get("title") or "Live stream"
+            # Description should be the live stream's title (description
+            # and title are interchangeable on YouTube Live broadcasts;
+            # we treat them as one field so Dispatcharr's grid view has
+            # something richer than just the bare title).
+            description = stream_data.get("description") or title
+
             grouped[tvg] = {
                 "tvg_id": tvg,
                 "channel_id": channel_id,
                 "channel_number": channel_number,
-                "channel_name": stream_data.get("channel") or stream_data.get("channel_name") or "YouTube",
-                "title": stream_data.get("title") or "Live stream",
-                "description": stream_data.get("description") or stream_data.get("title") or "Live stream",
+                "channel_name": channel_name,
+                "title": title,
+                "description": description,
                 "icon_url": stream_data.get("icon_url") or "",
                 "youtube_video_id": video_id,
-                "youtube_channel_id": stream_data.get("youtube_channel_id") or stream_data.get("youtube_channel"),
+                "youtube_channel_id": (
+                    stream_data.get("youtube_channel_id")
+                    or stream_data.get("youtube_channel")
+                ),
                 "live": True,
                 "source": "tracked",
             }
@@ -3843,8 +3916,9 @@ class Plugin:
         # 2. Channels that already exist pointing at each EPG source but
         # aren't in tracked_streams (ended streams from earlier). We still
         # want a guide entry for the duration of cleanup so clients don't
-        # briefly lose their programme. Use the channel's display name +
-        # EPGData name as the fallback title.
+        # briefly lose their programme. Channel.name already carries the
+        # "<YouTube Channel> #N" format _create_stream_and_channel
+        # stamped on it — we use that directly, never reconstruct.
         for epg_source in epg_sources:
             channels = (
                 Channel.objects
@@ -3857,13 +3931,14 @@ class Plugin:
                 )
                 if not tvg or tvg in grouped:
                     continue
+                channel_label = getattr(ch, "name", None) or "YouTube Live"
                 grouped[tvg] = {
                     "tvg_id": tvg,
                     "channel_id": ch.id,
                     "channel_number": ch.channel_number,
-                    "channel_name": getattr(ch, "name", None) or "YouTube",
-                    "title": getattr(ch, "name", None) or "Live stream",
-                    "description": getattr(ch, "name", None) or "Live stream",
+                    "channel_name": channel_label,
+                    "title": channel_label,
+                    "description": channel_label,
                     "icon_url": "",
                     "youtube_video_id": None,
                     "youtube_channel_id": None,
