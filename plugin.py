@@ -3281,23 +3281,49 @@ class Plugin:
 
             channel_id = None
 
-            # Look for channel ID in the HTML
-            # Pattern: "channelId":"UCxxxxxxxxxxxxxxxx"
-            match = re.search(r'"channelId":"(UC[a-zA-Z0-9_-]{22})"', html)
-            if match:
-                channel_id = match.group(1)
+            # Resolve the target channel's ID from the page. YouTube
+            # channel pages embed the canonical channel ID in a few
+            # stable places; pick the most reliable one first and fall
+            # back only when it is absent. NB: do NOT use a bare
+            # ``"channelId":"UC..."`` regex against the full HTML —
+            # such a pattern matches every recommended-channel widget
+            # in the sidebar, which is how distinct handles like
+            # ``@MaxVelocityWX`` and ``@MoreMaxVelocity`` end up
+            # sharing one channel ID in the cache.
 
-            # Alternative pattern: "externalId":"UCxxxxxxxxxxxxxxxx"
-            if not channel_id:
-                match = re.search(r'"externalId":"(UC[a-zA-Z0-9_-]{22})"', html)
-                if match:
-                    channel_id = match.group(1)
+            # 1. <meta itemprop="channelId" content="UC..."> (when present,
+            #    always identifies the requested channel).
+            meta_match = re.search(
+                r'<meta[^>]*itemprop="channelId"[^>]*content="(UC[a-zA-Z0-9_-]{22})"',
+                html,
+            )
+            if meta_match:
+                channel_id = meta_match.group(1)
 
-            # Try browse_id pattern
+            # 2. <meta property="og:url" content=".../channel/UC..."> (always
+            #    present, points at the canonical channel URL for the
+            #    requested @handle).
             if not channel_id:
-                match = re.search(r'"browseId":"(UC[a-zA-Z0-9_-]{22})"', html)
-                if match:
-                    channel_id = match.group(1)
+                og_match = re.search(
+                    r'<meta[^>]*property="og:url"[^>]*content="[^"]*/channel/(UC[a-zA-Z0-9_-]{22})"',
+                    html,
+                )
+                if og_match:
+                    channel_id = og_match.group(1)
+
+            # 3. The page canonical link tag.
+            if not channel_id:
+                canon_match = re.search(
+                    r'<link[^>]*rel="canonical"[^>]*href="[^"]*/channel/(UC[a-zA-Z0-9_-]{22})"',
+                    html,
+                )
+                if canon_match:
+                    channel_id = canon_match.group(1)
+
+            # 4. Last-resort scraping of the page's "externalId" object,
+            #    which is keyed to the channel owner of the page. We
+            #    intentionally do NOT match the loose "channelId":"UC..."
+            #    pattern because it collides on related-channel widgets.
 
             if channel_id:
                 self._log(f"Resolved @{username} to {channel_id}")
@@ -4527,12 +4553,27 @@ class Plugin:
         if isinstance(settings, dict):
             override = (settings.get("epg_data_dir") or "").strip()
         if not override:
+            # Canonical fallback: read epg_data_dir from PluginConfig.
+            # Step 1 is empty when the action handler does not carry the
+            # live blob (e.g. cross-worker action paths that go through
+            # Plugin.run only). PluginConfig is what Dispatcharr itself
+            # reads as the operator's saved config, so this is the
+            # authoritative path. Crucial: earlier versions took only
+            # step 1 and silently fell back to <plugin_dir>/epg/, which
+            # is why the operator's data dir override was being lost.
+            try:
+                from apps.plugins.models import PluginConfig
+                cfg = PluginConfig.objects.filter(plugin=self.name).first()
+                if cfg:
+                    stored = (cfg.settings or {}).get("epg_data_dir") or ""
+                    override = stored.strip()
+            except Exception:
+                pass
+        if not override:
             override = str(self._base_dir / "epg")
-        return (
-            os.path.realpath(override)
-            if os.path.isabs(override)
-            else os.path.abspath(override)
-        )
+        if os.path.isabs(override):
+            return os.path.realpath(override)
+        return os.path.abspath(override)
 
     def _xmltv_path(
         self, source_id: int, settings: Optional[Dict[str, Any]] = None
