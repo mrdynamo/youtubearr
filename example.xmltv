@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<tv generator-info-name="YouTubearr Plugin" generator-info-url="https://github.com/jeff-gooch/youtubearr">
+	<channel id="9106">
+		<display-name>Storm Chaser Corey Gerken #1</display-name>
+	</channel>
+	<programme start="20261009232638 +0000" stop="20261010112638 +0000" channel="9106">
+		<title>LIVE Storm Chase - Hurricane Isaias Coverage 2026-10-09 20:28</title>
+		<desc>LIVE Storm Chase - Hurricane Isaias Coverage 2026-10-09 20:28</desc>
+	</programme>
+	<channel id="9104">
+		<display-name>NASA #1</display-name>
+	</channel>
+	<programme start="20261009232638 +0000" stop="20261010112638 +0000" channel="9104">
+		<title>Live Video from the International Space Station (Official NASA Stream) 2026-10-09 20:26</title>
+		<desc>Live Video from the International Space Station (Official NASA Stream) 2026-10-09 20:26</desc>
+	</programme>
+	<channel id="9103">
+		<display-name>RaceSpotTV #1</display-name>
+	</channel>
+	<programme start="20261009232638 +0000" stop="20261010112638 +0000" channel="9103">
+		<title>Radical Esports Cup | 2026 S4 | Week 4 at Charlotte Motor Speedway 2026-10-09 21:01</title>
+		<desc>Radical Esports Cup | 2026 S4 | Week 4 at Charlotte Motor Speedway 2026-10-09 21:01</desc>
+	</programme>
+	<channel id="9105">
+		<display-name>NASA #2</display-name>
+	</channel>
+	<programme start="20261009232638 +0000" stop="20261010112638 +0000" channel="9105">
+		<title>Live High-Definition Views from the International Space Station (Official NASA Stream) 2026-10-09 20:26</title>
+		<desc>Live High-Definition Views from the International Space Station (Official NASA Stream) 2026-10-09 20:26</desc>
+	</programme>
+	<channel id="9107">
+		<display-name>Storm Chaser Brandon Copic #1</display-name>
+	</channel>
+	<programme start="20261009232638 +0000" stop="20261010112638 +0000" channel="9107">
+		<title>🔴LIVE: Major Hurricane Isaias – Florida Landfall Intercept (CAT 3) 2026-10-09 20:29</title>
+		<desc>🔴LIVE: Major Hurricane Isaias – Florida Landfall Intercept (CAT 3) 2026-10-09 20:29</desc>
+	</programme>
+	<channel id="9102">
+		<display-name>More Max Velocity #2</display-name>
+	</channel>
+	<programme start="20261009232638 +0000" stop="20261010112638 +0000" channel="9102">
+		<title>🔴 LIVE Severe Weather Coverage - Live Storm Chasers And Tornado Warnings... 2026-10-09 20:22</title>
+		<desc>🔴 LIVE Severe Weather Coverage - Live Storm Chasers And Tornado Warnings... 2026-10-09 20:22</desc>
+	</programme>
+	<channel id="9101">
+		<display-name>More Max Velocity #1</display-name>
+	</channel>
+	<programme start="20261009232638 +0000" stop="20261010112638 +0000" channel="9101">
+		<title>🔴 LIVE 24/7 Hurricane Isaias Coverage  - Live Storm Chasers And Tornado Warnings 2026-10-09 20:22</title>
+		<desc>🔴 LIVE 24/7 Hurricane Isaias Coverage  - Live Storm Chasers And Tornado Warnings 2026-10-09 20:22</desc>
+	</programme>
+	<channel id="9106.0">
+		<display-name>Storm Chaser Corey Gerken #1</display-name>
+	</channel>
+	<programme start="20261009232638 +0000" stop="20261010112638 +0000" channel="9106.0">
+		<title>Storm Chaser Corey Gerken #1</title>
+		<desc>Storm Chaser Corey Gerken #1</desc>
+	</programme>
+	<channel id="9104.0">
+		<display-name>NASA #1</display-name>
+	</channel>
+	<programme start="20261009232638 +0000" stop="20261010112638 +0000" channel="9104.0">
+		<title>NASA #1</title>
+		<desc>NASA #1</desc>
+	</programme>
+	<channel id="9103.0">
+		<display-name>RaceSpotTV #1</display-name>
+	</channel>
+	<programme start="20261009232638 +0000" stop="20261010112638 +0000" channel="9103.0">
+		<title>RaceSpotTV #1</title>
+		<desc>RaceSpotTV #1</desc>
+	</programme>
+	<channel id="9107.0">
+		<display-name>Storm Chaser Brandon Copic #1</display-name>
+	</channel>
+	<programme start="20261009232638 +0000" stop="20261010112638 +0000" channel="9107.0">
+		<title>Storm Chaser Brandon Copic #1</title>
+		<desc>Storm Chaser Brandon Copic #1</desc>
+	</programme>
+</tv>
