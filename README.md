@@ -15,7 +15,7 @@ YouTubearr is a Dispatcharr plugin that monitors YouTube channels for livestream
 - **Sub-Channel Grouping**: Group related streams with decimal channels (90.1, 90.2, etc.)
 - **Title Filtering**: Regex filters for channels with many simultaneous streams
 - **Quality Selection**: Choose preferred stream quality (Best, 1080p, 720p, 480p)
-- **Channel Profiles**: Automatically add new channels to a Dispatcharr channel profile
+- **Channel Profiles**: Automatically add new channels to one or more Dispatcharr channel profiles
 - **Media Refresh Webhook**: Trigger an external endpoint (e.g., Jellyfin guide refresh) when channels are added or removed
 - **Notification Webhook**: Generic webhook notification when new streams go live — works with Telegram, Discord, Home Assistant, or any webhook bridge
 - **Diagnostics**: Built-in health check action to verify plugin state and configuration
@@ -70,7 +70,7 @@ That's it. No pip install, no apt-get, no API keys. The bundled yt-dlp binary ha
 - **Starting Channel Number**: First channel number to assign (default: 2000)
 - **Channel Number Increment**: How much to increment for each new stream (default: 1)
 - **YouTube Cookies**: Paste cookies in Netscape/Mozilla format for authenticated requests and Streamlink playback. See [YouTube Cookies and Authentication](#youtube-cookies-and-authentication) below for setup, sidecar details, and maintenance.
-- **Channel Profile**: Optional Dispatcharr channel profile to automatically add new channels to
+- **Channel Profiles**: Optional Dispatcharr channel profile(s) to automatically add new channels to. Enter one per line or comma-separated (e.g. `Emby-Other, Main`); names are case-insensitive. Missing profiles are logged and skipped without affecting the others.
 - **EPG Source Name**: Name of the EPG source for guide data (default: "YouTube Live"). Supports `{title}` and `{channel}` placeholders.
 - **Manual URL**: Paste a YouTube livestream URL for quick manual addition
 

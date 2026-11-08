@@ -148,10 +148,10 @@ class Plugin:
         },
         {
             "id": "channel_profile_name",
-            "label": "Channel Profile",
-            "type": "string",
+            "label": "Channel Profiles",
+            "type": "text",
             "default": "",
-            "help_text": "Name of Channel Profile to add created channels to (e.g., 'Primary'). Leave empty to skip.",
+            "help_text": "Channel Profile(s) to add created channels to. One per line or comma-separated (e.g., 'Emby-Other, Main'). Names are case-insensitive. Leave empty to skip.",
         },
         {
             "id": "starting_channel_number",
@@ -2071,11 +2071,42 @@ class Plugin:
             defaults={"order": 0}
         )
 
-        # Add to Channel Profile if configured
-        channel_profile_name = settings.get("channel_profile_name", "").strip()
-        if channel_profile_name:
+        # Add to Channel Profile(s) if configured
+        self._add_channel_to_profiles(channel, settings)
+
+        return stream, channel
+
+    @staticmethod
+    def _parse_channel_profile_names(raw: Any) -> List[str]:
+        """Parse the Channel Profiles setting into a de-duplicated list of names.
+
+        Accepts newline- and/or comma-separated names (a single name, as in
+        older configs, still works). Blank entries are dropped and duplicates
+        are removed case-insensitively, preserving first-seen order.
+        """
+        if not raw:
+            return []
+        if isinstance(raw, (list, tuple)):
+            raw = "\n".join(str(item) for item in raw)
+        names: List[str] = []
+        seen = set()
+        for line in str(raw).splitlines():
+            for part in line.split(","):
+                name = part.strip()
+                if name and name.lower() not in seen:
+                    seen.add(name.lower())
+                    names.append(name)
+        return names
+
+    def _add_channel_to_profiles(self, channel, settings: Dict[str, Any]) -> None:
+        """Add a channel to every configured Channel Profile.
+
+        Each profile is handled independently so a missing or failing profile
+        does not prevent membership in the others.
+        """
+        for profile_name in self._parse_channel_profile_names(settings.get("channel_profile_name", "")):
             try:
-                profile = ChannelProfile.objects.filter(name__iexact=channel_profile_name).first()
+                profile = ChannelProfile.objects.filter(name__iexact=profile_name).first()
                 if profile:
                     ChannelProfileMembership.objects.get_or_create(
                         channel_profile=profile,
@@ -2084,11 +2115,9 @@ class Plugin:
                     )
                     self._log(f"Added channel to profile '{profile.name}'")
                 else:
-                    self._log(f"Warning: Channel Profile '{channel_profile_name}' not found")
+                    self._log(f"Warning: Channel Profile '{profile_name}' not found")
             except Exception as profile_exc:
-                self._log_error(f"Failed to add channel to profile: {profile_exc}")
-
-        return stream, channel
+                self._log_error(f"Failed to add channel to profile '{profile_name}': {profile_exc}")
 
     def _parse_channel_number_mapping(self, settings: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         """Parse channel number mapping from monitored_channels setting.

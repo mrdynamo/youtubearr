@@ -1,5 +1,11 @@
 # YouTubearr Changelog
 
+## [Unreleased]
+
+### Added
+
+- **Multiple Channel Profiles**: The **Channel Profiles** setting (formerly *Channel Profile*) now accepts multiple profile names, one per line or comma-separated (e.g. `Emby-Other, Main`). Created channels are added to every listed profile. Matching is case-insensitive, duplicates are ignored, and a missing or failing profile is logged without blocking membership in the others. Existing single-profile configurations keep working unchanged (same setting key, `channel_profile_name`).
+
 ## [1.40.1] - 2026-09-16
 
 ### Fixed

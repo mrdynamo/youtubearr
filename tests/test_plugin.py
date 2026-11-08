@@ -3936,3 +3936,61 @@ class TestStopAndResetLockRetention(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ── Multiple Channel Profiles ───────────────────────────────────────────────
+
+class TestChannelProfiles(unittest.TestCase):
+
+    def test_parse_single_name_backward_compatible(self):
+        self.assertEqual(Plugin._parse_channel_profile_names("Emby-Other"), ["Emby-Other"])
+
+    def test_parse_comma_separated(self):
+        self.assertEqual(Plugin._parse_channel_profile_names("Emby-Other, Main"), ["Emby-Other", "Main"])
+
+    def test_parse_multiline_and_mixed(self):
+        raw = "Emby-Other\nMain\r\n\n  Kids , Sports,\n"
+        self.assertEqual(Plugin._parse_channel_profile_names(raw), ["Emby-Other", "Main", "Kids", "Sports"])
+
+    def test_parse_dedupes_case_insensitively(self):
+        self.assertEqual(Plugin._parse_channel_profile_names("Main\nmain, MAIN"), ["Main"])
+
+    def test_parse_empty(self):
+        for raw in ("", None, "  \n , \n"):
+            self.assertEqual(Plugin._parse_channel_profile_names(raw), [])
+
+    def test_add_channel_to_each_profile_and_skip_missing(self):
+        p = _make_plugin()
+        logs = []
+        p._log = logs.append
+        channel = MagicMock()
+        emby, main = MagicMock(), MagicMock()
+        emby.name, main.name = "Emby-Other", "Main"
+        lookup = {"emby-other": emby, "main": main}
+
+        def _filter(name__iexact):
+            return MagicMock(first=MagicMock(return_value=lookup.get(name__iexact.lower())))
+
+        with patch("plugin.ChannelProfile") as cp, patch("plugin.ChannelProfileMembership") as cpm:
+            cp.objects.filter.side_effect = _filter
+            p._add_channel_to_profiles(channel, {"channel_profile_name": "Emby-Other\nMissing, Main"})
+
+        profiles = [c.kwargs["channel_profile"] for c in cpm.objects.get_or_create.call_args_list]
+        self.assertEqual(profiles, [emby, main])
+        for c in cpm.objects.get_or_create.call_args_list:
+            self.assertIs(c.kwargs["channel"], channel)
+            self.assertEqual(c.kwargs["defaults"], {"enabled": True})
+        self.assertTrue(any("'Missing' not found" in m for m in logs))
+
+    def test_failure_on_one_profile_does_not_block_others(self):
+        p = _make_plugin()
+        errors = []
+        p._log_error = errors.append
+        good = MagicMock()
+        with patch("plugin.ChannelProfile") as cp, patch("plugin.ChannelProfileMembership") as cpm:
+            cp.objects.filter.return_value.first.return_value = good
+            cpm.objects.get_or_create.side_effect = [Exception("boom"), (MagicMock(), True)]
+            p._add_channel_to_profiles(MagicMock(), {"channel_profile_name": "A, B"})
+        self.assertEqual(cpm.objects.get_or_create.call_count, 2)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("'A'", errors[0])
